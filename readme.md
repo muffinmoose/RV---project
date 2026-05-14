@@ -165,7 +165,4 @@ Po zagonu pipeline-a najdeš v `data/results/`:
 
 ---
 
-## Avtor
-
-**[Tvoje ime]** — [predmet] @ [fakulteta]  
 Akademsko leto 2025/26

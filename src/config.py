@@ -4,7 +4,7 @@
 # ─── PATHS ────────────────────────────────────────────────────────────────────
 DATA_ROOT       = "/media/FastDataMama/data_rv_26/Data"
 VIDEO_ROOT      = "/media/FastDataMama/imep/"
-CALIB_FILE      = "/media/FastDataMama/data_rv_26/ukc_calibration.json"
+CALIB_FILE = "/media/FastDataMama/zigab/calibration_photos/ukc_calibration.json"
 RESULTS_DIR     = "data/results/"
 
 # ─── CAMERA MAPPING ───────────────────────────────────────────────────────────

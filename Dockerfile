@@ -14,3 +14,4 @@ RUN pip install --no-cache-dir \
     pandas
 
 WORKDIR /workdir
+ENV PYTHONPATH=/workdir:/workdir/src:/workdir/config

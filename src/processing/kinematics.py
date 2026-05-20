@@ -123,13 +123,13 @@ class KinematicsCalculator:
                        if self._start_pos is not None else None
 
         return KinematicState(
-            position=mm_pos,
-            velocity=velocity,
-            velocity_vec=velocity_vec,
-            acceleration=acceleration,
-            path_length=self._path_length,
-            displacement=displacement,
-        )
+        position=mm_pos / 1000.0,           # mm → m
+        velocity=velocity / 1000.0 if velocity is not None else None,
+        velocity_vec=velocity_vec / 1000.0 if velocity_vec is not None else None,
+        acceleration=acceleration / 1000.0 if acceleration is not None else None,
+        path_length=self._path_length / 1000.0,
+        displacement=displacement / 1000.0 if displacement is not None else None,
+    )
 
     def reset(self):
         """Reset all state — call between videos/patients."""

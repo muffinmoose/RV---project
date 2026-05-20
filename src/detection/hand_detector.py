@@ -23,7 +23,7 @@ class HandDetection:
     """
     Result of detecting a hand in one frame.
     All coordinates are in pixels (float), relative to the original frame size.
-    None means MediaPipe did not detect a hand this frame → Kalman will interpolate.
+    None means MediaPipe did not detect a hand this frame →  will interpolate.
     """
     wrist:     Optional[np.ndarray]   # shape (2,) → [x, y]
     thumb_tip: Optional[np.ndarray]

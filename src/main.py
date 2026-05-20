@@ -1,4 +1,11 @@
 # src/main.py
+# Entry point for 9HPT Kinematic Analysis
+# Runs headless on server — outputs annotated video + graphs + CSV
+#
+# Usage:
+#   Interactive:  python3 src/main.py
+#   Batch:        python3 src/main.py /path/video1.mp4 /path/video2.mp4
+
 import cv2
 import csv
 import sys
@@ -30,6 +37,7 @@ def list_patients(data_root: str) -> list:
 
 
 def list_videos(patient_dir: Path, preferred_cam: str = PRIMARY_CAMERA) -> list:
+    """Return videos sorted by camera preference — primary camera first."""
     videos    = sorted(patient_dir.glob("*.mp4"))
     preferred = [v for v in videos if preferred_cam in v.name]
     others    = [v for v in videos if preferred_cam not in v.name]
@@ -45,10 +53,9 @@ def select_patient_interactive() -> Path:
 
     while True:
         patients = list_patients(DATA_ROOT)
-        pid = input(f"Enter patient ID (from 001 to — {len(patients):03d}): ").strip()
+        pid = input(f"Enter patient ID (patient_001 — patient_{len(patients):03d}): ").strip()
         if pid in patients:
             break
-        # Try partial match
         matches = [p for p in patients if pid in p]
         if len(matches) == 1:
             pid = matches[0]
@@ -82,10 +89,9 @@ def select_patient_interactive() -> Path:
 
 # ── Results saving ────────────────────────────────────────────────────────────
 
-def save_results(patient_id, video_name, events, results_dir, log):
-    out_dir  = Path(results_dir) / patient_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{Path(video_name).stem}_results.csv"
+def save_results(patient_id, video_stem, events, out_dir, log):
+    """Save peg events to CSV in the video-specific output folder."""
+    out_path = Path(out_dir) / f"{video_stem}_results.csv"
 
     fieldnames = [
         "peg_number", "duration_s",
@@ -116,14 +122,24 @@ def save_results(patient_id, video_name, events, results_dir, log):
 # ── Core processing ───────────────────────────────────────────────────────────
 
 def process_video(video_path: Path):
-    """Process a single video file. Called for both interactive and batch mode."""
-
+    """
+    Process a single video file.
+    Output structure: results/<patient_id>/<video_stem>/
+    Called for both interactive and batch mode.
+    """
     patient_id = video_path.parent.name
+    stem       = video_path.stem
 
-    log = setup_logger(patient_id, video_path.name)
+    # Each video gets its own subfolder — overwrite if exists
+    out_dir = Path(RESULTS_DIR) / patient_id / stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    log = setup_logger(patient_id, video_path.name, log_dir=str(out_dir))
     log.info(f"Patient : {patient_id}")
     log.info(f"Video   : {video_path.name}")
+    log.info(f"Output  : {out_dir}")
 
+    # Open video
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         log.error(f"Cannot open video: {video_path}")
@@ -135,6 +151,7 @@ def process_video(video_path: Path):
     frame_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     log.info(f"{frame_w}x{frame_h} @ {actual_fps:.1f}fps ({total_frames} frames)")
 
+    # Load calibration (K, D, H) for this camera
     cal = Calibrator()
     cal.load_intrinsics_for_video(str(video_path))
     if not cal.is_ready():
@@ -143,18 +160,11 @@ def process_video(video_path: Path):
         return
     log.info("Calibration ready")
 
-    out_dir   = Path(RESULTS_DIR) / patient_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem      = video_path.stem
+    # Output file paths
     out_video = str(out_dir / f"{stem}_analyzed.mp4")
     out_graph = str(out_dir / f"{stem}_graphs.png")
 
-    # Skip if already processed
-    if Path(out_video).exists():
-        log.info(f"Already processed — skipping. Delete output to reprocess.")
-        cap.release()
-        return
-
+    # Init all modules
     detector = HandDetector()
     hk       = HandKalman(fps=actual_fps)
     mk       = MultiLandmarkKinematics(fps=actual_fps)
@@ -173,23 +183,49 @@ def process_video(video_path: Path):
         if not ret:
             break
 
+        # Undistort frame for accurate pixel coordinates
+        frame = cal.undistort_frame(frame)
+
+        # Initialize hole tracker on first frame
         if not ht_initialized:
             ht.initialize(frame)
             ht_initialized = True
 
+        # ── Pipeline ──────────────────────────────────────────────────────────
         detection    = detector.process(frame)
         smooth_px    = hk.update(detection)
         smooth_mm    = {k: cal.pixel_to_mm(v) for k, v in smooth_px.items()}
         states       = mk.update(smooth_mm)
         phase, event = pd.update(states, frame_idx)
 
-        ht.update(frame)
+        # Update hole filled/empty state
+        # Pridobi wrist pixel koordinate za hole tracker
+        wrist_state = states.get("wrist")
+        wrist_px = None
+        if wrist_state and wrist_state.position is not None:
+            # position je v mm — rabimo px koordinate iz smooth_px
+            wp = smooth_px.get("wrist")
+            if wp is not None:
+                wrist_px = (int(wp[0]), int(wp[1]))
+
+        # Pridobi vse landmark koordinate v pikslih za sector guard
+        all_lm_px = None
+        if detection.all_landmarks is not None:
+            # Pridobi vse 21 landmark koordinate v pikslih
+            h_f, w_f = frame.shape[:2]
+            all_lm_px = [
+                (lm.x * w_f, lm.y * h_f)
+                for lm in detection.all_landmarks.landmark
+            ]
+
+        ht.update(frame, all_lm_px)
 
         if event:
             log.info(f"Peg {event.peg_number} completed — {event.duration_s:.2f}s")
 
         history.record(frame_idx, states, phase)
 
+        # Write annotated frame to output video
         viz.write_frame(
             frame=          frame,
             states=         states,
@@ -209,6 +245,7 @@ def process_video(video_path: Path):
 
         frame_idx += 1
 
+    # ── Cleanup & save outputs ────────────────────────────────────────────────
     cap.release()
     detector.close()
     viz.close()
@@ -217,7 +254,7 @@ def process_video(video_path: Path):
     save_graphs(history, out_graph, patient_id, video_path.name)
 
     if pd.events:
-        save_results(patient_id, video_path.name, pd.events, RESULTS_DIR, log)
+        save_results(patient_id, stem, pd.events, out_dir, log)
         log.info(f"Total pegs detected: {pd.peg_count}")
     else:
         log.warning("No peg events detected — check thresholds.")
@@ -241,7 +278,6 @@ def run():
             print(f"\n── Processing: {video_path.name} ──")
             process_video(video_path)
         print("\nBatch done.")
-
     else:
         # Interactive mode
         video_path = select_patient_interactive()

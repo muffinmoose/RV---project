@@ -1,6 +1,16 @@
 # utils/logger.py
 # Simple logger for 9HPT analysis
 # Logs to both terminal and a log file simultaneously
+#
+# Usage:
+#   log = setup_logger(patient_id="patient_001", video_name="...", log_dir="results/patient_001/video_stem")
+#   log.info("Starting analysis")
+#   log.warning("Something off")
+#   log.error("Critical failure")
+#
+# From anywhere else in codebase:
+#   from utils.logger import get_logger
+#   log = get_logger()
 
 import logging
 import sys
@@ -10,22 +20,21 @@ from datetime import datetime
 from config import RESULTS_DIR
 
 
-def setup_logger(patient_id: str = "", video_name: str = "") -> logging.Logger:
+def setup_logger(patient_id: str = "", video_name: str = "",
+                 log_dir: str = "") -> logging.Logger:
     """
     Set up and return the project logger.
-    Creates a log file under data/results/<patient_id>/
+    Logs to terminal (INFO+) and to a .log file (DEBUG+).
 
-    Usage:
-        from utils.logger import setup_logger
-        log = setup_logger(patient_id="patient_001", video_name="patient_001camP_1_...")
-        log.info("Starting analysis")
-        log.warning("Checkerboard not found")
-        log.error("Video could not be opened")
+    Args:
+        patient_id:  used for default log folder if log_dir not provided
+        video_name:  used for log filename
+        log_dir:     if provided, log file goes here (video-specific subfolder)
     """
     logger = logging.getLogger("9HPT")
     logger.setLevel(logging.DEBUG)
 
-    # Avoid adding duplicate handlers if called multiple times
+    # Avoid duplicate handlers if called multiple times
     if logger.handlers:
         logger.handlers.clear()
 
@@ -41,15 +50,19 @@ def setup_logger(patient_id: str = "", video_name: str = "") -> logging.Logger:
     logger.addHandler(console)
 
     # ── File handler ──────────────────────────────────────────────────────────
-    log_dir = Path(RESULTS_DIR) / (patient_id or "general")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # Use provided log_dir (video subfolder) or fallback to patient folder
+    if log_dir:
+        out_dir = Path(log_dir)
+    else:
+        out_dir = Path(RESULTS_DIR) / (patient_id or "general")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem      = Path(video_name).stem if video_name else "session"
-    log_path  = log_dir / f"{stem}_{timestamp}.log"
+    log_path  = out_dir / f"{stem}_{timestamp}.log"
 
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)   # log everything to file
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -59,11 +72,7 @@ def setup_logger(patient_id: str = "", video_name: str = "") -> logging.Logger:
 
 def get_logger() -> logging.Logger:
     """
-    Get the existing logger anywhere in the codebase without passing it around.
-
-    Usage:
-        from utils.logger import get_logger
-        log = get_logger()
-        log.info("something happened")
+    Get existing logger from anywhere in codebase without passing it around.
+    Must call setup_logger() first.
     """
     return logging.getLogger("9HPT")

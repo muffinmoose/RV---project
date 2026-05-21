@@ -9,6 +9,10 @@
 #   5. Hysteresis: CONFIRM_FRAMES consecutive dark frames to mark filled
 #   6. Group change guard: >MAX_SIMULTANEOUS changes = roka/LED event, ignore
 #   7. Sector guard: any hand landmark inside sector bbox = skip that sector
+#
+# active_side property:
+#   'L' = left sector active  → patient uses RIGHT hand
+#   'R' = right sector active → patient uses LEFT hand
 
 import cv2
 import numpy as np
@@ -17,25 +21,14 @@ from config import LEFT_HOLES_PX, RIGHT_HOLES_PX, HOLE_RADIUS_PX
 SAMPLE_RADIUS       = 6
 STABILIZE_THRESHOLD = 3.0
 STABILIZE_WINDOW    = 10
-DROP_THRESHOLD      = 0.25   # brightness drop >25% from initial = LED event
-COMEBACK_WINDOW     = 50     # frames after drop to detect comeback
+DROP_THRESHOLD      = 0.25
+COMEBACK_WINDOW     = 50
 FILL_THRESHOLD      = 0.65
 CONFIRM_FRAMES      = 5
 MAX_SIMULTANEOUS    = 2
 
 
 class HoleTracker:
-    """
-    Tracks filled/empty state of all 18 holes (9 left + 9 right).
-
-    Usage:
-        ht = HoleTracker()
-        ht.initialize(first_frame)
-        ht.update(frame, all_landmarks)
-        ht.draw(frame)
-        count = ht.filled_count
-    """
-
     def __init__(self):
         self.holes               = []
         self._initialized        = False
@@ -51,14 +44,8 @@ class HoleTracker:
         self._prev_mean          = None
         self._stable_count       = 0
 
-    # ── Initialization ────────────────────────────────────────────────────────
-
     def initialize(self, frame: np.ndarray):
-        """
-        Called once on first frame.
-        Registers hole positions and sector bounding boxes.
-        Baseline set dynamically after LED drop + comeback.
-        """
+        """Called once on first frame. Registers hole positions and sector bboxes."""
         self.holes = []
         all_holes = (
             [("L", i, px) for i, px in enumerate(LEFT_HOLES_PX)] +
@@ -66,17 +53,11 @@ class HoleTracker:
         )
         for side, idx, (x, y) in all_holes:
             self.holes.append({
-                "x":          x,
-                "y":          y,
-                "side":       side,
-                "idx":        idx,
-                "filled":     False,
-                "baseline":   None,
-                "led_off":    False,
-                "dark_count": 0,
+                "x": x, "y": y, "side": side, "idx": idx,
+                "filled": False, "baseline": None,
+                "led_off": False, "dark_count": 0,
             })
 
-        # Sector bounding boxes with margin
         margin = int(HOLE_RADIUS_PX * 3)
         lx = [h["x"] for h in self.holes if h["side"] == "L"]
         ly = [h["y"] for h in self.holes if h["side"] == "L"]
@@ -101,34 +82,21 @@ class HoleTracker:
         print(f"[HoleTracker] Left bbox:  {self._left_bbox}")
         print(f"[HoleTracker] Right bbox: {self._right_bbox}")
 
-    # ── Per-frame update ──────────────────────────────────────────────────────
-
     def update(self, frame: np.ndarray, all_landmarks=None) -> int:
-        """
-        Update filled/empty state for each hole.
-
-        Args:
-            frame:         undistorted BGR frame
-            all_landmarks: list of 21 (x, y) px coords or None
-        Returns:
-            number of confirmed filled holes
-        """
+        """Update filled/empty state. Returns number of filled holes."""
         if not self._initialized:
             return 0
 
         self._frame_count += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Wait for LED drop + comeback before setting baseline
         if not self._baseline_set:
             self._check_stabilization(gray)
             return 0
 
-        # Check which sectors are blocked by hand
         left_blocked  = self._sector_blocked(all_landmarks, "L")
         right_blocked = self._sector_blocked(all_landmarks, "R")
 
-        # Sample brightness for all active holes
         candidates = []
         for h in self.holes:
             if h["baseline"] is None or h["led_off"]:
@@ -143,7 +111,6 @@ class HoleTracker:
             is_dark    = brightness < h["baseline"] * FILL_THRESHOLD
             candidates.append((h, is_dark))
 
-        # Group change guard — too many changes = roka or LED event
         would_change = sum(1 for h, is_dark in candidates if is_dark != h["filled"])
         if would_change > MAX_SIMULTANEOUS:
             for h, _ in candidates:
@@ -151,7 +118,6 @@ class HoleTracker:
             self.filled_count = sum(1 for h in self.holes if h["filled"])
             return self.filled_count
 
-        # Hysteresis — confirm after CONFIRM_FRAMES
         for h, is_dark in candidates:
             if is_dark:
                 h["dark_count"] += 1
@@ -164,15 +130,8 @@ class HoleTracker:
         self.filled_count = sum(1 for h in self.holes if h["filled"])
         return self.filled_count
 
-    # ── Drawing ───────────────────────────────────────────────────────────────
-
     def draw(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Draw circles:
-          Gray  = stabilizing (baseline not set)
-          Blue  = empty
-          Green = filled
-        """
+        """Draw circles: gray=stabilizing, blue=empty, green=filled."""
         if not self._initialized:
             return frame
         r = int(HOLE_RADIUS_PX)
@@ -181,7 +140,7 @@ class HoleTracker:
             if not self._baseline_set:
                 color, thickness = (128, 128, 128), 2
             elif h["led_off"]:
-                continue  # don't draw inactive sector holes
+                continue
             elif h["filled"]:
                 color, thickness = (0, 255, 0), -1
             else:
@@ -189,33 +148,39 @@ class HoleTracker:
             cv2.circle(frame, (x, y), r, color, thickness)
         return frame
 
-    # ── State ─────────────────────────────────────────────────────────────────
-
     def get_state(self) -> list:
         return [(h["side"], h["idx"], h["filled"]) for h in self.holes]
 
-    # ── Private ───────────────────────────────────────────────────────────────
+    @property
+    def active_side(self):
+        """
+        Returns which sector has active LEDs.
+        'L' = left sector active  → patient uses RIGHT hand
+        'R' = right sector active → patient uses LEFT hand
+        None = not yet determined
+        """
+        if not self._baseline_set:
+            return None
+        left_active  = any(not h["led_off"] for h in self.holes if h["side"] == "L")
+        right_active = any(not h["led_off"] for h in self.holes if h["side"] == "R")
+        if left_active and not right_active:
+            return "L"
+        if right_active and not left_active:
+            return "R"
+        return None
 
     def _check_stabilization(self, gray: np.ndarray):
-        """
-        Three-phase detection:
-        Phase 1: Record initial brightness (all LEDs on)
-        Phase 2: Detect negative front (LED drop >DROP_THRESHOLD)
-        Phase 3: Detect positive front (comeback) within COMEBACK_WINDOW,
-                 then wait for stabilization and set baseline
-        """
+        """Three-phase: initial → drop → comeback → baseline."""
         mean_b = np.mean([
             self._sample_brightness(gray, h["x"], h["y"])
             for h in self.holes
         ])
 
-        # Phase 1: record initial
         if self._initial_brightness is None:
             self._initial_brightness = mean_b
             self._prev_mean          = mean_b
             return
 
-        # Phase 2: watch for drop
         if not self._drop_detected:
             drop_ratio = (self._initial_brightness - mean_b) / self._initial_brightness
             if drop_ratio > DROP_THRESHOLD:
@@ -228,11 +193,9 @@ class HoleTracker:
             self._prev_mean = mean_b
             return
 
-        # Track minimum after drop
         if mean_b < self._min_brightness:
             self._min_brightness = mean_b
 
-        # Phase 3: detect comeback or timeout, then stabilize
         frames_since_drop = self._frame_count - self._drop_frame
         comeback_ratio    = (mean_b - self._min_brightness) / max(self._initial_brightness, 1)
 
@@ -248,29 +211,26 @@ class HoleTracker:
         self._prev_mean = mean_b
 
     def _set_baseline(self, gray: np.ndarray):
-        """
-        Set baseline per hole.
-        Compare each hole brightness to initial — recovered = active, dark = inactive.
-        """
+        """Set baseline — dark holes = inactive, bright = active."""
         brightnesses = [
             self._sample_brightness(gray, h["x"], h["y"])
             for h in self.holes
         ]
-
         for h, b in zip(self.holes, brightnesses):
             h["baseline"] = b
-            # Recovery ratio vs initial brightness
             recovery = b / max(self._initial_brightness, 1)
             if recovery > 0.5:
-                h["led_off"] = False   # active sector — track
+                h["led_off"] = False
             else:
-                h["led_off"] = True    # inactive sector — never fill
+                h["led_off"] = True
                 h["filled"]  = False
 
         self._baseline_set = True
         active = sum(1 for h in self.holes if not h["led_off"])
         print(f"[HoleTracker] Baseline set at frame {self._frame_count}")
         print(f"[HoleTracker] Active holes: {active}/18")
+        print(f"[HoleTracker] Active side: {self.active_side} "
+              f"→ patient uses {'RIGHT' if self.active_side == 'L' else 'LEFT'} hand")
 
     def _sector_blocked(self, all_landmarks, side: str) -> bool:
         """True if any landmark is inside the sector bounding box."""

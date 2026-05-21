@@ -1,5 +1,11 @@
 # detection/hand_detector.py
 # MediaPipe-based hand detector for 9HPT kinematic analysis
+#
+# Strategy:
+#   1. Detect up to MP_MAX_HANDS hands
+#   2. Wait for baseline_ready signal (HoleTracker must set baseline first)
+#   3. Activation: index_tip OR thumb_tip enters STORAGE_BBOX_PX
+#   4. Once activated → track that hand FOR ENTIRE VIDEO
 
 import cv2
 import mediapipe as mp
@@ -15,92 +21,128 @@ from config import (
     LANDMARK_COLOR,
     LANDMARK_RADIUS,
     SKELETON_COLOR,
+    BOARD_HOLES_BBOX_PX,
+    STORAGE_BBOX_PX,
 )
 
 
 @dataclass
 class HandDetection:
     """
-    Result of detecting a hand in one frame.
-    All coordinates are in pixels (float), relative to the original frame size.
-    None means MediaPipe did not detect a hand this frame →  will interpolate.
+    Result of detecting the active hand in one frame.
+    All None if active hand not yet found or lost this frame.
     """
-    wrist:     Optional[np.ndarray]   # shape (2,) → [x, y]
-    thumb_tip: Optional[np.ndarray]
-    index_tip: Optional[np.ndarray]
-    all_landmarks: Optional[list]     # full 21-point list, for drawing
+    wrist:         Optional[np.ndarray]
+    thumb_tip:     Optional[np.ndarray]
+    index_tip:     Optional[np.ndarray]
+    all_landmarks: Optional[object]
 
 
 class HandDetector:
     """
-    Wraps MediaPipe Hands for single-hand, top-down 9HPT video.
-
-    Usage:
-        detector = HandDetector()
-        for frame in video:
-            detection = detector.process(frame)
-            if detection.wrist is not None:
-                x, y = detection.wrist
+    Stateful hand detector.
+    Waits for HoleTracker baseline before activating.
+    Locks onto first hand entering storage bbox — tracks for entire video.
     """
 
     def __init__(self):
         self._mp_hands = mp.solutions.hands
         self._mp_draw  = mp.solutions.drawing_utils
-        self._mp_styles = mp.solutions.drawing_styles
 
         self.hands = self._mp_hands.Hands(
-            static_image_mode=False,          # video mode → uses tracking
+            static_image_mode=False,
             max_num_hands=MP_MAX_HANDS,
             min_detection_confidence=MP_DETECTION_CONFIDENCE,
             min_tracking_confidence=MP_TRACKING_CONFIDENCE,
         )
 
-    def process(self, frame: np.ndarray) -> HandDetection:
+        self._active_hand_idx = None   # index of active hand in MediaPipe results
+        self._activated       = False  # True once active hand is locked
+
+    def process(self, frame: np.ndarray,
+                baseline_ready: bool = False) -> HandDetection:
         """
         Run MediaPipe on one BGR frame.
-        Returns HandDetection with pixel coords, or all-None if no hand found.
+
+        Args:
+            frame:          undistorted BGR frame
+            baseline_ready: True when HoleTracker has set baseline.
+                            Before this, no activation is possible.
+
+        Returns:
+            HandDetection with active hand coords, or all-None.
         """
         h, w = frame.shape[:2]
+        sx1, sy1, sx2, sy2 = STORAGE_BBOX_PX
 
-        # MediaPipe expects RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False          # small perf gain
+        rgb.flags.writeable = False
         results = self.hands.process(rgb)
         rgb.flags.writeable = True
 
         if not results.multi_hand_landmarks:
-            return HandDetection(
-                wrist=None,
-                thumb_tip=None,
-                index_tip=None,
-                all_landmarks=None,
-            )
+            return HandDetection(wrist=None, thumb_tip=None,
+                                 index_tip=None, all_landmarks=None)
 
-        # Take the first (and ideally only) detected hand
-        hand_lm = results.multi_hand_landmarks[0]
-        lm = hand_lm.landmark   # list of 21 NormalizedLandmark (x,y,z in [0,1])
+        n_hands = len(results.multi_hand_landmarks)
 
-        def to_px(idx: int) -> np.ndarray:
+        def to_px(lm, idx: int) -> np.ndarray:
+            """Convert normalized landmark to pixel coordinates."""
             return np.array([lm[idx].x * w, lm[idx].y * h], dtype=np.float32)
 
-        return HandDetection(
-            wrist=     to_px(LANDMARKS_OF_INTEREST["wrist"]),
-            thumb_tip= to_px(LANDMARKS_OF_INTEREST["thumb_tip"]),
-            index_tip= to_px(LANDMARKS_OF_INTEREST["index_tip"]),
-            all_landmarks=hand_lm,
-        )
+        def in_bbox(lm, idx, x1, y1, x2, y2) -> bool:
+            """True if landmark idx is inside bbox."""
+            lx = lm[idx].x * w
+            ly = lm[idx].y * h
+            return x1 <= lx <= x2 and y1 <= ly <= y2
+
+        def make_detection(hand_lm) -> HandDetection:
+            lm = hand_lm.landmark
+            return HandDetection(
+                wrist=     to_px(lm, LANDMARKS_OF_INTEREST["wrist"]),
+                thumb_tip= to_px(lm, LANDMARKS_OF_INTEREST["thumb_tip"]),
+                index_tip= to_px(lm, LANDMARKS_OF_INTEREST["index_tip"]),
+                all_landmarks=hand_lm,
+            )
+
+        # Already activated — always return same hand index
+        if self._activated:
+            if self._active_hand_idx < n_hands:
+                return make_detection(
+                    results.multi_hand_landmarks[self._active_hand_idx]
+                )
+            else:
+                # Temporarily lost — Kalman will interpolate
+                return HandDetection(wrist=None, thumb_tip=None,
+                                     index_tip=None, all_landmarks=None)
+
+        # Not yet activated — wait for baseline before locking
+        if not baseline_ready:
+            return HandDetection(wrist=None, thumb_tip=None,
+                                 index_tip=None, all_landmarks=None)
+
+        # Baseline is ready — look for hand entering storage bbox
+        for i, hand_lm in enumerate(results.multi_hand_landmarks):
+            lm = hand_lm.landmark
+            index_in = in_bbox(lm, LANDMARKS_OF_INTEREST["index_tip"],
+                               sx1, sy1, sx2, sy2)
+            thumb_in  = in_bbox(lm, LANDMARKS_OF_INTEREST["thumb_tip"],
+                                sx1, sy1, sx2, sy2)
+            if index_in or thumb_in:
+                self._active_hand_idx = i
+                self._activated       = True
+                print(f"[HandDetector] Active hand locked: index={i}")
+                return make_detection(hand_lm)
+
+        return HandDetection(wrist=None, thumb_tip=None,
+                             index_tip=None, all_landmarks=None)
 
     def draw(self, frame: np.ndarray, detection: HandDetection) -> np.ndarray:
-        """
-        Draw skeleton + landmark dots on frame (in-place copy).
-        Call only when landmarks toggle is ON.
-        """
+        """Draw skeleton + landmark dots on frame."""
         if detection.all_landmarks is None:
             return frame
 
         out = frame.copy()
-
-        # Full MediaPipe skeleton (connections)
         self._mp_draw.draw_landmarks(
             out,
             detection.all_landmarks,
@@ -116,7 +158,6 @@ class HandDetector:
             ),
         )
 
-        # Extra highlight on our three key points
         h, w = frame.shape[:2]
         for name, coords in [
             ("W",  detection.wrist),
@@ -132,10 +173,8 @@ class HandDetector:
         return out
 
     def close(self):
-        """Release MediaPipe resources."""
         self.hands.close()
 
-    # Context manager support
     def __enter__(self):
         return self
 

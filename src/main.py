@@ -16,6 +16,7 @@ from config import (
     RESULTS_DIR,
     PRIMARY_CAMERA,
     FPS,
+    BOARD_HOLES_BBOX_PX,
 )
 
 from detection.hand_detector   import HandDetector
@@ -32,16 +33,15 @@ from utils.logger              import setup_logger
 # ── Patient / video selection ─────────────────────────────────────────────────
 
 def list_patients(data_root: str) -> list:
+    """Return sorted list of patient folder names."""
     root = Path(data_root)
     return sorted([d.name for d in root.iterdir() if d.is_dir()])
 
 
 def list_videos(patient_dir: Path, preferred_cam: str = PRIMARY_CAMERA) -> list:
-    """Return videos sorted by camera preference — primary camera first."""
-    videos    = sorted(patient_dir.glob("*.mp4"))
-    preferred = [v for v in videos if preferred_cam in v.name]
-    others    = [v for v in videos if preferred_cam not in v.name]
-    return preferred + others
+    """Return only primary camera (camP_1) videos, sorted by name."""
+    videos = sorted(patient_dir.glob("*.mp4"))
+    return [v for v in videos if preferred_cam in v.name]
 
 
 def select_patient_interactive() -> Path:
@@ -69,13 +69,12 @@ def select_patient_interactive() -> Path:
     patient_dir = Path(DATA_ROOT) / pid
     videos = list_videos(patient_dir)
     if not videos:
-        print(f"No videos found for {pid}")
+        print(f"No camP_1 videos found for {pid}")
         sys.exit(1)
 
-    print(f"\nVideos for {pid}:")
+    print(f"\nVideos for {pid} (camP_1 only):")
     for i, v in enumerate(videos):
-        star = " ★" if PRIMARY_CAMERA in v.name else ""
-        print(f"  [{i}] {v.name}{star}")
+        print(f"  [{i}] {v.name}")
 
     while True:
         try:
@@ -130,7 +129,7 @@ def process_video(video_path: Path):
     patient_id = video_path.parent.name
     stem       = video_path.stem
 
-    # Each video gets its own subfolder — overwrite if exists
+    # Each video gets its own subfolder
     out_dir = Path(RESULTS_DIR) / patient_id / stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -174,6 +173,7 @@ def process_video(video_path: Path):
     history  = KinematicHistory(fps=actual_fps)
 
     log.info("Processing video...")
+    log.info(f"Active hand bbox: {BOARD_HOLES_BBOX_PX}")
     frame_idx      = 0
     show_landmarks = True
     ht_initialized = False
@@ -192,32 +192,27 @@ def process_video(video_path: Path):
             ht_initialized = True
 
         # ── Pipeline ──────────────────────────────────────────────────────────
-        detection    = detector.process(frame)
+
+        # Hand detection — activation waits for HoleTracker baseline
+        # baseline_ready=True unlocks storage bbox trigger in HandDetector
+        detection = detector.process(frame, baseline_ready=ht._baseline_set)
+
         smooth_px    = hk.update(detection)
         smooth_mm    = {k: cal.pixel_to_mm(v) for k, v in smooth_px.items()}
         states       = mk.update(smooth_mm)
         phase, event = pd.update(states, frame_idx)
 
-        # Update hole filled/empty state
-        # Pridobi wrist pixel koordinate za hole tracker
-        wrist_state = states.get("wrist")
-        wrist_px = None
-        if wrist_state and wrist_state.position is not None:
-            # position je v mm — rabimo px koordinate iz smooth_px
-            wp = smooth_px.get("wrist")
-            if wp is not None:
-                wrist_px = (int(wp[0]), int(wp[1]))
-
-        # Pridobi vse landmark koordinate v pikslih za sector guard
+        # Get all landmark coordinates for hole tracker sector guard
+        # Only passed when active hand is detected
         all_lm_px = None
         if detection.all_landmarks is not None:
-            # Pridobi vse 21 landmark koordinate v pikslih
             h_f, w_f = frame.shape[:2]
             all_lm_px = [
                 (lm.x * w_f, lm.y * h_f)
                 for lm in detection.all_landmarks.landmark
             ]
 
+        # Update hole filled/empty state
         ht.update(frame, all_lm_px)
 
         if event:

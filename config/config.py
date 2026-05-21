@@ -21,37 +21,40 @@ CALIB_BOARD_ROWS = 6
 CALIB_SQUARE_MM  = 20.0
 
 # ─── 9HPT BOARD DIMENSIONS ────────────────────────────────────────────────────
-# Vrednosti iz click_holes.py meritev (originalen frame 640x480, brez rotacije)
 HOLE_SPACING_MM          = 32.0
 HOLE_SPACING_PX          = 34.6
 HOLE_DIAMETER_MM         = 10.0
-HOLE_RADIUS_PX           = 8       # za detekcijo filled/empty
+HOLE_RADIUS_PX           = 8
 HOLE_ROWS                = 3
 HOLE_COLS                = 3
 
-# Pixel koordinate luknjic (originalen frame, camP_1)
-# Levo polje (spodaj na originalnem framu) — stolpci L→D, vrstice spodaj→zgoraj
+# Pixel koordinate luknjic (originalen frame, camP_1, undistorted)
+# Levo polje (spodaj) — stolpci L→D, vrstice spodaj→zgoraj
 LEFT_HOLES_PX = [
-    (340, 409), (373, 403), (405, 397),   # stolpec 1: L1, L4, L7
-    (339, 371), (372, 367), (405, 361),   # stolpec 2: L2, L5, L8
-    (338, 333), (372, 330), (404, 326),   # stolpec 3: L3, L6, L9
+    (340, 409), (373, 403), (405, 397),
+    (339, 371), (372, 367), (405, 361),
+    (338, 333), (372, 330), (404, 326),
 ]
 
-# Desno polje (zgoraj na originalnem framu)
+# Desno polje (zgoraj)
 RIGHT_HOLES_PX = [
-    (335, 111), (369, 114), (400, 116),   # stolpec 1: R1, R4, R7
-    (335,  73), (368,  78), (400,  81),   # stolpec 2: R2, R5, R8
-    (335,  37), (368,  42), (399,  47),   # stolpec 3: R3, R6, R9
+    (335, 111), (369, 114), (400, 116),
+    (335,  73), (368,  78), (400,  81),
+    (335,  37), (368,  42), (399,  47),
 ]
 
 STORAGE_CENTER_PX        = (367, 221)
 LEFT_FIELD_CENTER_PX     = (372, 367)
 RIGHT_FIELD_CENTER_PX    = (368,  78)
 
+# Board bboxes
+BOARD_HOLES_BBOX_PX = (250, 10, 500, 490) #vse luknjice + malo prostora okoli
+STORAGE_BBOX_PX = (250, 120, 480, 330) # samo krog kjer so pini
+
 # ─── MEDIAPIPE ────────────────────────────────────────────────────────────────
-MP_MAX_HANDS             = 1
-MP_DETECTION_CONFIDENCE  = 0.5
-MP_TRACKING_CONFIDENCE   = 0.5
+MP_MAX_HANDS             = 2
+MP_DETECTION_CONFIDENCE  = 0.2
+MP_TRACKING_CONFIDENCE   = 0.2
 
 LANDMARKS_OF_INTEREST = {
     "wrist":     0,

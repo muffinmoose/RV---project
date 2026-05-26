@@ -16,4 +16,4 @@ testing/manifest*.txt
 
 # Analysis outputi (generirani grafi in CSV)
 testing/analysis/*.png
-testing/analysis/*.csv
+testing/analysis/*.csv__pycache__/

@@ -125,7 +125,7 @@ def process_video(video_path: Path):
     """
     Process a single video file.
     Output structure: results/<patient_id>/<video_stem>/
-    Called for both interactive and batch mode.
+    Called for both interactive and batch mode
     """
     patient_id = video_path.parent.name
     stem       = video_path.stem
@@ -222,10 +222,11 @@ def process_video(video_path: Path):
         if ht._baseline_set:
             history.set_baseline_frame(frame_idx)
 
-        # Record kinematics every frame; pass index_tip pixel coords for trajectory
-        idx_tip  = smooth_px.get("index_tip")
-        index_px = (float(idx_tip[0]), float(idx_tip[1])) if idx_tip is not None and idx_tip.any() else None
-        history.record(frame_idx, states, phase, index_tip_px=index_px)
+        # Trajektorija temelji na index_mcp (landmark 5) — stabilnejši od index_tip
+        # index_mcp je členek kazalca na dlani, manj skače med gibanjem
+        mcp_px = detection.index_mcp
+        mcp_coords = (float(mcp_px[0]), float(mcp_px[1])) if mcp_px is not None else None
+        history.record(frame_idx, states, phase, index_tip_px=mcp_coords)
 
         # Write annotated frame to output video
         viz.write_frame(
@@ -253,19 +254,26 @@ def process_video(video_path: Path):
     viz.close()
 
     log.info("Generating graphs...")
-    save_graphs(history, out_graph, patient_id, video_path.name)
+    # Posreduj events in hand_side za tabelo povzetkov
+    hand_side = "right" if ht.active_side == "L" else "left"
+    save_graphs(history, out_graph, patient_id, video_path.name,
+                events=pd.events, hand_side=hand_side)
 
     out_board = str(out_dir / f"{stem}_board.png")
     place_order = [idx for side, idx in ht.fill_order]
     pick_order  = [idx for side, idx in ht.pick_order]
     hand_side   = "right" if ht.active_side == "L" else "left"
+    # Posreduj calibrator za mm koordinate luknjic in trajektorije
     save_board_figure(
         place_order, pick_order, out_board, patient_id,
         side=hand_side,
         trajectory_px=history.index_px,
         frame_w=frame_w,
         frame_h=frame_h,
+        calibrator=cal,
     )
+
+
     log.info(f"Board figure saved → {out_board}")
 
     if pd.events:

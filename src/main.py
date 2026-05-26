@@ -5,10 +5,13 @@
 # Usage:
 #   Interactive:  python3 src/main.py
 #   Batch:        python3 src/main.py /path/video1.mp4 /path/video2.mp4
+#   Profesor:     python3 src/main.py --input /path/patient_dir --output /path/output
+#   Profesor:     python3 src/main.py --input /path/video.mp4 --output /path/output
 
 import cv2
 import csv
 import sys
+import argparse
 from pathlib import Path
 
 from config import (
@@ -105,14 +108,14 @@ def save_results(patient_id, video_stem, events, out_dir, log):
         writer.writeheader()
         for ev in events:
             writer.writerow({
-                "peg_number":       ev.peg_number,
-                "duration_s":       round(ev.duration_s, 3),
-                "mean_velocity":    round(ev.mean_velocity, 4)    if ev.mean_velocity    is not None else "",
-                "max_velocity":     round(ev.max_velocity, 4)     if ev.max_velocity     is not None else "",
-                "mean_acceleration":round(ev.mean_acceleration, 4)if ev.mean_acceleration is not None else "",
-                "path_length":      round(ev.path_length, 4)      if ev.path_length      is not None else "",
-                "frame_start":      ev.frame_start,
-                "frame_end":        ev.frame_end,
+                "peg_number":        ev.peg_number,
+                "duration_s":        round(ev.duration_s, 3),
+                "mean_velocity":     round(ev.mean_velocity, 4)     if ev.mean_velocity     is not None else "",
+                "max_velocity":      round(ev.max_velocity, 4)      if ev.max_velocity      is not None else "",
+                "mean_acceleration": round(ev.mean_acceleration, 4) if ev.mean_acceleration is not None else "",
+                "path_length":       round(ev.path_length, 4)       if ev.path_length       is not None else "",
+                "frame_start":       ev.frame_start,
+                "frame_end":         ev.frame_end,
             })
 
     log.info(f"Results saved → {out_path}")
@@ -121,17 +124,25 @@ def save_results(patient_id, video_stem, events, out_dir, log):
 
 # ── Core processing ───────────────────────────────────────────────────────────
 
-def process_video(video_path: Path):
+def process_video(video_path: Path, output_root: str = None):
     """
-    Process a single video file.
-    Output structure: results/<patient_id>/<video_stem>/
-    Called for both interactive and batch mode
+    Procesira en video file.
+
+    Args:
+        video_path:   pot do .mp4 datoteke
+        output_root:  opcijska override za izhodno mapo
+                      (profesor --output argument).
+                      Če None → uporabi RESULTS_DIR iz config.py.
+
+    Output struktura:
+        <output_root>/<patient_id>/<video_stem>/
     """
     patient_id = video_path.parent.name
     stem       = video_path.stem
 
-    # Each video gets its own subfolder
-    out_dir = Path(RESULTS_DIR) / patient_id / stem
+    # Določi izhodno mapo — profesor lahko overrida z --output
+    base_out = Path(output_root) if output_root else Path(RESULTS_DIR)
+    out_dir  = base_out / patient_id / stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log = setup_logger(patient_id, video_path.name, log_dir=str(out_dir))
@@ -139,7 +150,7 @@ def process_video(video_path: Path):
     log.info(f"Video   : {video_path.name}")
     log.info(f"Output  : {out_dir}")
 
-    # Open video
+    # Odpri video
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         log.error(f"Cannot open video: {video_path}")
@@ -151,7 +162,7 @@ def process_video(video_path: Path):
     frame_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     log.info(f"{frame_w}x{frame_h} @ {actual_fps:.1f}fps ({total_frames} frames)")
 
-    # Load calibration (K, D, H) for this camera
+    # Naloži kalibracijo (K, D, H) za to kamero
     cal = Calibrator()
     cal.load_intrinsics_for_video(str(video_path))
     if not cal.is_ready():
@@ -160,11 +171,11 @@ def process_video(video_path: Path):
         return
     log.info("Calibration ready")
 
-    # Output file paths
+    # Poti izhodnih datotek
     out_video = str(out_dir / f"{stem}_analyzed.mp4")
     out_graph = str(out_dir / f"{stem}_graphs.png")
 
-    # Init all modules
+    # Inicializacija vseh modulov
     detector = HandDetector()
     hk       = HandKalman(fps=actual_fps)
     mk       = MultiLandmarkKinematics(fps=actual_fps)
@@ -184,26 +195,27 @@ def process_video(video_path: Path):
         if not ret:
             break
 
-        # Undistort frame for accurate pixel coordinates
+        # Undistort frame za točne pixel koordinate
         frame = cal.undistort_frame(frame)
 
-        # Initialize hole tracker on first frame
+        # Inicializacija HoleTrackerja na prvem frameu
         if not ht_initialized:
             ht.initialize(frame)
             ht_initialized = True
 
         # ── Pipeline ──────────────────────────────────────────────────────────
 
-        # Hand detection — activation waits for HoleTracker baseline
+        # Detekcija roke — aktivacija čaka na HoleTracker baseline
         detection = detector.process(frame, baseline_ready=ht._baseline_set)
 
         smooth_px    = hk.update(detection)
         smooth_mm    = {k: cal.pixel_to_mm(v) for k, v in smooth_px.items()}
         states       = mk.update(smooth_mm)
+
         # PhaseDetector dobi filled_count iz HoleTracker — faze temeljijo na luknjicah
         phase, event = pd.update(states, frame_idx, filled_count=ht.filled_count)
 
-        # Get all landmark coordinates for hole tracker sector guard
+        # Vse landmark koordinate za HoleTracker sector guard
         all_lm_px = None
         if detection.all_landmarks is not None:
             h_f, w_f = frame.shape[:2]
@@ -212,23 +224,22 @@ def process_video(video_path: Path):
                 for lm in detection.all_landmarks.landmark
             ]
 
-        # Update hole filled/empty state
+        # Posodobi stanje luknjic
         ht.update(frame, all_lm_px)
 
         if event:
             log.info(f"Peg {event.peg_number} completed — {event.duration_s:.2f}s")
 
-        # Notify history when baseline first set (for Kalman spike suppression)
+        # Obvesti history ko je baseline prvič nastavljen (Kalman spike suppression)
         if ht._baseline_set:
             history.set_baseline_frame(frame_idx)
 
         # Trajektorija temelji na index_mcp (landmark 5) — stabilnejši od index_tip
-        # index_mcp je členek kazalca na dlani, manj skače med gibanjem
-        mcp_px = detection.index_mcp
+        mcp_px     = detection.index_mcp
         mcp_coords = (float(mcp_px[0]), float(mcp_px[1])) if mcp_px is not None else None
         history.record(frame_idx, states, phase, index_tip_px=mcp_coords)
 
-        # Write annotated frame to output video
+        # Zapiši anotirani frame v izhodni video
         viz.write_frame(
             frame=          frame,
             states=         states,
@@ -248,22 +259,19 @@ def process_video(video_path: Path):
 
         frame_idx += 1
 
-    # ── Cleanup & save outputs ────────────────────────────────────────────────
+    # ── Cleanup & shrani outpute ──────────────────────────────────────────────
     cap.release()
     detector.close()
     viz.close()
 
     log.info("Generating graphs...")
-    # Posreduj events in hand_side za tabelo povzetkov
     hand_side = "right" if ht.active_side == "L" else "left"
     save_graphs(history, out_graph, patient_id, video_path.name,
                 events=pd.events, hand_side=hand_side)
 
-    out_board = str(out_dir / f"{stem}_board.png")
+    out_board   = str(out_dir / f"{stem}_board.png")
     place_order = [idx for side, idx in ht.fill_order]
     pick_order  = [idx for side, idx in ht.pick_order]
-    hand_side   = "right" if ht.active_side == "L" else "left"
-    # Posreduj calibrator za mm koordinate luknjic in trajektorije
     save_board_figure(
         place_order, pick_order, out_board, patient_id,
         side=hand_side,
@@ -272,8 +280,6 @@ def process_video(video_path: Path):
         frame_h=frame_h,
         calibrator=cal,
     )
-
-
     log.info(f"Board figure saved → {out_board}")
 
     if pd.events:
@@ -288,11 +294,64 @@ def process_video(video_path: Path):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run():
-    args = sys.argv[1:]
+    """
+    Trije načini zagona:
 
-    if args:
-        print(f"Batch mode — {len(args)} video(s)")
-        for path_str in args:
+    1. Interaktivni:
+       python3 src/main.py
+
+    2. Batch (direktne poti do videov):
+       python3 src/main.py /pot/video1.mp4 /pot/video2.mp4
+
+    3. Profesor način (--input / --output):
+       python3 src/main.py --input /pot/do/patient_dir --output /pot/do/outputa
+       python3 src/main.py --input /pot/do/video.mp4   --output /pot/do/outputa
+       --output je opcijski — če ga ni, gre v RESULTS_DIR iz config.py
+    """
+    # Loči --input/--output argumente od direktnih poti
+    parser = argparse.ArgumentParser(
+        description="9HPT Kinematic Analysis",
+        add_help=True
+    )
+    parser.add_argument("--input",  type=str, default=None,
+                        help="Pot do mape pacienta ali video datoteke")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Pot do izhodne mape (privzeto: testing/results/)")
+    parser.add_argument("videos",   nargs="*",
+                        help="Direktne poti do video datotek (batch način)")
+    parsed = parser.parse_args()
+
+    # ── Način 3: Profesor — --input / --output ────────────────────────────────
+    if parsed.input:
+        input_path  = Path(parsed.input)
+        output_root = parsed.output  # None če ni podan → process_video uporabi config
+
+        # --input je mapa pacienta → vzemi vse camP_1 videe
+        if input_path.is_dir():
+            videos = sorted(input_path.glob("*camP_1*.mp4"))
+            if not videos:
+                videos = sorted(input_path.glob("*.mp4"))
+            if not videos:
+                print(f"No videos found in {input_path}")
+                return
+        # --input je direktno video
+        elif input_path.is_file():
+            videos = [input_path]
+        else:
+            print(f"--input not found: {input_path}")
+            return
+
+        print(f"Professor mode — {len(videos)} video(s)")
+        for video_path in videos:
+            print(f"\n── Processing: {video_path.name} ──")
+            process_video(video_path, output_root=output_root)
+        print("\nDone.")
+        return
+
+    # ── Način 2: Batch — direktne poti ───────────────────────────────────────
+    if parsed.videos:
+        print(f"Batch mode — {len(parsed.videos)} video(s)")
+        for path_str in parsed.videos:
             video_path = Path(path_str)
             if not video_path.exists():
                 print(f"  SKIP: not found — {path_str}")
@@ -300,9 +359,11 @@ def run():
             print(f"\n── Processing: {video_path.name} ──")
             process_video(video_path)
         print("\nBatch done.")
-    else:
-        video_path = select_patient_interactive()
-        process_video(video_path)
+        return
+
+    # ── Način 1: Interaktivni ─────────────────────────────────────────────────
+    video_path = select_patient_interactive()
+    process_video(video_path)
 
 
 if __name__ == "__main__":

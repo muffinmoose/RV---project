@@ -194,4 +194,4 @@ results/
 *.log
 
 # Batch log
-batch_log.txt
+batch_log.txttesting/results/

@@ -5,7 +5,7 @@
 DATA_ROOT    = "/media/FastDataMama/data_rv_26/Data"
 VIDEO_ROOT   = "/media/FastDataMama/imep/"
 CALIB_FILE   = "config/calibration.json"
-RESULTS_DIR  = "results/"
+RESULTS_DIR  = "testing/results/"
 
 # ─── CAMERA MAPPING ───────────────────────────────────────────────────────────
 CAMERA_MAP = {

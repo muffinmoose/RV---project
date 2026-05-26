@@ -53,8 +53,8 @@ STORAGE_BBOX_PX = (250, 120, 480, 330) # samo krog kjer so pini
 
 # ─── MEDIAPIPE ────────────────────────────────────────────────────────────────
 MP_MAX_HANDS             = 2
-MP_DETECTION_CONFIDENCE  = 0.2
-MP_TRACKING_CONFIDENCE   = 0.2
+MP_DETECTION_CONFIDENCE  = 0.6   # bil 0.2 — preveč lažnih zaznav rok
+MP_TRACKING_CONFIDENCE   = 0.5   # bil 0.2 — tracking preveč nestabilen
 
 LANDMARKS_OF_INTEREST = {
     "wrist":     0,

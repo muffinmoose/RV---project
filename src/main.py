@@ -28,6 +28,7 @@ from analysis.hole_tracker     import HoleTracker
 from analysis.graphs           import KinematicHistory, save_graphs
 from utils.visualizer          import Visualizer
 from utils.logger              import setup_logger
+from analysis.graphs           import save_board_figure
 
 
 # ── Patient / video selection ─────────────────────────────────────────────────
@@ -94,8 +95,8 @@ def save_results(patient_id, video_stem, events, out_dir, log):
 
     fieldnames = [
         "peg_number", "duration_s",
-        "reach_frames", "grasp_frames",
-        "transport_frames", "place_frames",
+        "mean_velocity", "max_velocity", "mean_acceleration",
+        "path_length",
         "frame_start", "frame_end",
     ]
 
@@ -106,10 +107,10 @@ def save_results(patient_id, video_stem, events, out_dir, log):
             writer.writerow({
                 "peg_number":       ev.peg_number,
                 "duration_s":       round(ev.duration_s, 3),
-                "reach_frames":     ev.reach_frames,
-                "grasp_frames":     ev.grasp_frames,
-                "transport_frames": ev.transport_frames,
-                "place_frames":     ev.place_frames,
+                "mean_velocity":    round(ev.mean_velocity, 4)    if ev.mean_velocity    is not None else "",
+                "max_velocity":     round(ev.max_velocity, 4)     if ev.max_velocity     is not None else "",
+                "mean_acceleration":round(ev.mean_acceleration, 4)if ev.mean_acceleration is not None else "",
+                "path_length":      round(ev.path_length, 4)      if ev.path_length      is not None else "",
                 "frame_start":      ev.frame_start,
                 "frame_end":        ev.frame_end,
             })
@@ -194,16 +195,15 @@ def process_video(video_path: Path):
         # ── Pipeline ──────────────────────────────────────────────────────────
 
         # Hand detection — activation waits for HoleTracker baseline
-        # baseline_ready=True unlocks storage bbox trigger in HandDetector
         detection = detector.process(frame, baseline_ready=ht._baseline_set)
 
         smooth_px    = hk.update(detection)
         smooth_mm    = {k: cal.pixel_to_mm(v) for k, v in smooth_px.items()}
         states       = mk.update(smooth_mm)
-        phase, event = pd.update(states, frame_idx)
+        # PhaseDetector dobi filled_count iz HoleTracker — faze temeljijo na luknjicah
+        phase, event = pd.update(states, frame_idx, filled_count=ht.filled_count)
 
         # Get all landmark coordinates for hole tracker sector guard
-        # Only passed when active hand is detected
         all_lm_px = None
         if detection.all_landmarks is not None:
             h_f, w_f = frame.shape[:2]
@@ -218,7 +218,14 @@ def process_video(video_path: Path):
         if event:
             log.info(f"Peg {event.peg_number} completed — {event.duration_s:.2f}s")
 
-        history.record(frame_idx, states, phase)
+        # Notify history when baseline first set (for Kalman spike suppression)
+        if ht._baseline_set:
+            history.set_baseline_frame(frame_idx)
+
+        # Record kinematics every frame; pass index_tip pixel coords for trajectory
+        idx_tip  = smooth_px.get("index_tip")
+        index_px = (float(idx_tip[0]), float(idx_tip[1])) if idx_tip is not None and idx_tip.any() else None
+        history.record(frame_idx, states, phase, index_tip_px=index_px)
 
         # Write annotated frame to output video
         viz.write_frame(
@@ -248,6 +255,19 @@ def process_video(video_path: Path):
     log.info("Generating graphs...")
     save_graphs(history, out_graph, patient_id, video_path.name)
 
+    out_board = str(out_dir / f"{stem}_board.png")
+    place_order = [idx for side, idx in ht.fill_order]
+    pick_order  = [idx for side, idx in ht.pick_order]
+    hand_side   = "right" if ht.active_side == "L" else "left"
+    save_board_figure(
+        place_order, pick_order, out_board, patient_id,
+        side=hand_side,
+        trajectory_px=history.index_px,
+        frame_w=frame_w,
+        frame_h=frame_h,
+    )
+    log.info(f"Board figure saved → {out_board}")
+
     if pd.events:
         save_results(patient_id, stem, pd.events, out_dir, log)
         log.info(f"Total pegs detected: {pd.peg_count}")
@@ -263,7 +283,6 @@ def run():
     args = sys.argv[1:]
 
     if args:
-        # Batch mode — process all provided video paths
         print(f"Batch mode — {len(args)} video(s)")
         for path_str in args:
             video_path = Path(path_str)
@@ -274,7 +293,6 @@ def run():
             process_video(video_path)
         print("\nBatch done.")
     else:
-        # Interactive mode
         video_path = select_patient_interactive()
         process_video(video_path)
 

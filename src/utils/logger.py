@@ -15,7 +15,6 @@
 import logging
 import sys
 from pathlib import Path
-from datetime import datetime
 
 from config import RESULTS_DIR
 
@@ -57,9 +56,8 @@ def setup_logger(patient_id: str = "", video_name: str = "",
         out_dir = Path(RESULTS_DIR) / (patient_id or "general")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem      = Path(video_name).stem if video_name else "session"
-    log_path  = out_dir / f"{stem}_{timestamp}.log"
+    log_path  = out_dir / f"{stem}.log"
 
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)

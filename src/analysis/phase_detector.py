@@ -1,276 +1,222 @@
 # analysis/phase_detector.py
-# Rule-based phase detection for 9HPT
+# HoleTracker-based phase detection za 9HPT
 #
-# The 9HPT cycle per peg:
-#   IDLE       → hand is resting, test not started
-#   REACHING   → hand moving toward peg hole (high velocity, moving to target)
-#   GRASPING   → hand slowing down near hole (low velocity, pinch forming)
-#   TRANSPORTING → hand moving peg to destination hole
-#   PLACING    → hand slowing down at destination (low velocity)
-#   RETURNING  → hand moving back to peg storage area
+# Strategija (namesto rule-based velocity/pinch):
+#   filled_count raste 0→9  = PLACING faza  (pacient polni luknjice)
+#   filled_count pada  9→0  = RETURNING faza (pacient jemlje pine nazaj)
+#   Vsaka nova zapolnjena luknjica = en PegEvent
 #
-# Detection is purely rule-based:
-#   - velocity thresholds  (from KinematicState)
-#   - pinch distance       (thumb_tip ↔ index_tip distance in mm)
-#   - position proximity   to known hole locations
+# PhaseDetector.update() sedaj sprejme tudi filled_count iz HoleTracker.
+# Kinematični states (velocity, pinch) se še vedno beležijo za grafe —
+# samo štetje pegov in faz temelji na luknjicah.
 
 import numpy as np
 from enum import Enum, auto
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List
 
-from config import FPS, HOLE_SPACING_MM, HOLE_ROWS, HOLE_COLS
+from config import FPS
 
 
 # ── Phase definitions ─────────────────────────────────────────────────────────
 
 class Phase(Enum):
-    IDLE         = auto()
-    REACHING     = auto()
-    GRASPING     = auto()
-    TRANSPORTING = auto()
-    PLACING      = auto()
-    RETURNING    = auto()
+    IDLE      = auto()   # čakanje pred testom / med testi
+    PLACING   = auto()   # pacient polni luknjice (filled_count raste)
+    RETURNING = auto()   # pacient jemlje pine nazaj (filled_count pada)
 
 
-# ── Thresholds (tune these after seeing real data) ────────────────────────────
-
-# Velocity thresholds in mm/s
-VEL_MOVING_THRESHOLD  = 15.0   # above this → hand is moving
-VEL_SLOW_THRESHOLD    = 8.0    # below this → hand is slowing / stationary
-
-# Pinch distance thresholds in mm
-PINCH_CLOSED_MM = 25.0   # thumb-index distance below this → closed pinch (holding peg)
-PINCH_OPEN_MM   = 40.0   # above this → open hand (not holding)
-
-# How many consecutive frames must confirm a phase before switching
-PHASE_CONFIRM_FRAMES = 4
-
-
-# ── Event logged when a peg cycle completes ───────────────────────────────────
+# ── Peg event ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class PegEvent:
-    """One complete peg pick-and-place cycle."""
-    peg_number:      int
-    frame_start:     int
-    frame_end:       int
-    duration_s:      float
-    reach_frames:    int = 0
-    grasp_frames:    int = 0
-    transport_frames:int = 0
-    place_frames:    int = 0
+    """En zapolnjen pin — od prejšnjega fill do tega fill."""
+    peg_number:   int     # zaporedna številka pina (1-9)
+    frame_start:  int     # frame ko je bil prejšnji pin zapolnjen
+    frame_end:    int     # frame ko je bil ta pin zapolnjen
+    duration_s:   float   # čas med dvema zaporednima filloma (sekunde)
+    # Kinematični povzetki za ta interval (iz states)
+    mean_velocity:    Optional[float] = None   # m/s
+    max_velocity:     Optional[float] = None   # m/s
+    mean_acceleration:Optional[float] = None   # m/s²
+    path_length:      Optional[float] = None   # m
 
 
 # ── Main detector ─────────────────────────────────────────────────────────────
 
 class PhaseDetector:
     """
-    Stateful rule-based phase detector.
-    Feed it one frame at a time via update().
+    HoleTracker-based phase detector.
 
-    Usage:
+    Kliči update() za vsak frame iz main.py.
+    Posreduj filled_count iz HoleTracker — vse ostalo je avtomatsko.
+
+    Uporaba:
         pd = PhaseDetector()
-        for frame_idx, states in enumerate(kinematic_states):
-            phase, event = pd.update(states, frame_idx)
-            if event:
-                print(f"Peg {event.peg_number} done in {event.duration_s:.2f}s")
-        pd.reset()
+        phase, event = pd.update(states, frame_idx, filled_count=ht.filled_count)
+        if event:
+            print(f"Pin {event.peg_number} → {event.duration_s:.2f}s")
     """
 
     def __init__(self):
-        self.current_phase:   Phase = Phase.IDLE
-        self._candidate:      Phase = Phase.IDLE
-        self._candidate_count: int  = 0
+        self.current_phase = Phase.IDLE
 
-        self._phase_start_frame: int = 0
-        self._peg_count:         int = 0
+        self._peg_count        = 0          # koliko pinov zapolnjenih
+        self._last_fill_frame  = 0          # frame zadnjega fill eventa
+        self._last_filled      = 0          # prejšnji filled_count
+        self._placing_started  = False      # ali je PLACING faza začeta
+        self._returning_started= False      # ali je RETURNING faza začeta
 
-        # Frame counters per phase in current peg cycle
-        self._reach_frames:     int = 0
-        self._grasp_frames:     int = 0
-        self._transport_frames: int = 0
-        self._place_frames:     int = 0
+        # Kinematični buffer za trenutni interval med dvema filloma
+        self._interval_velocities:     List[float] = []
+        self._interval_accelerations:  List[float] = []
+        self._interval_path_start:     float = 0.0
 
-        self._cycle_start_frame: int = 0
-
-        # History for UI / logging
-        self.phase_history: List[Phase] = []
+        self.phase_history: List[Phase]    = []
         self.events:        List[PegEvent] = []
 
-    # ── Main update ───────────────────────────────────────────────────────────
+    # ── Glavni update ─────────────────────────────────────────────────────────
 
-    def update(self, states: dict, frame_idx: int) -> tuple:
+    def update(self, states: dict, frame_idx: int,
+               filled_count: int = 0) -> tuple:
         """
+        Kliče se vsak frame iz main.py.
+
         Args:
-            states:    dict of KinematicState — output of MultiLandmarkKinematics
-            frame_idx: current frame number
+            states:       dict KinematicState iz MultiLandmarkKinematics
+            frame_idx:    trenutna številka framea
+            filled_count: ht.filled_count iz HoleTracker (0-9)
 
         Returns:
-            (Phase, Optional[PegEvent])
-            PegEvent is not None when a full peg cycle just completed.
+            (Phase, Optional[PegEvent]) — nikoli None
         """
-        # Extract features
-        wrist     = states["wrist"]
-        thumb     = states["thumb_tip"]
-        index     = states["index_tip"]
+        try:
+            wrist = states.get("wrist")
 
-        velocity  = wrist.velocity or 0.0
-        pinch_dist = self._pinch_distance(thumb.position, index.position)
+            # Zberaj kinematiko za trenutni interval
+            if wrist is not None:
+                if wrist.velocity is not None:
+                    self._interval_velocities.append(wrist.velocity)
+                if wrist.acceleration is not None:
+                    self._interval_accelerations.append(abs(wrist.acceleration))
 
-        # Determine candidate phase from rules
-        candidate = self._classify(velocity, pinch_dist)
+            # ── Določi fazo iz filled_count ───────────────────────────────────
+            if filled_count > 0 and not self._placing_started:
+                # Začetek PLACING — prvi pin zapolnjen
+                self._placing_started  = True
+                self._returning_started= False
+                self.current_phase     = Phase.PLACING
+                self._last_fill_frame  = frame_idx
+                self._last_filled      = filled_count
+                print(f"[PhaseDetector] PLACING started at frame {frame_idx}")
 
-        # Require PHASE_CONFIRM_FRAMES consecutive frames before switching
-        if candidate == self._candidate:
-            self._candidate_count += 1
-        else:
-            self._candidate       = candidate
-            self._candidate_count = 1
+            elif filled_count == 9 and self._placing_started and not self._returning_started:
+                # Vsi pini zapolnjeni — čakamo na začetek RETURNING
+                self.current_phase = Phase.PLACING
 
-        event = None
-        if self._candidate_count >= PHASE_CONFIRM_FRAMES:
-            if candidate != self.current_phase:
-                event = self._on_phase_change(candidate, frame_idx)
-                self.current_phase = candidate
+            elif filled_count < self._last_filled and self._placing_started:
+                if not self._returning_started:
+                    # Začetek RETURNING — prvi pin vzet nazaj
+                    self._returning_started = True
+                    self.current_phase      = Phase.RETURNING
+                    print(f"[PhaseDetector] RETURNING started at frame {frame_idx}")
+                else:
+                    self.current_phase = Phase.RETURNING
 
-        # Count frames per phase in current cycle
-        self._count_phase_frame(self.current_phase)
+            elif filled_count == 0 and self._returning_started:
+                # Konec — vsi pini vzeti nazaj
+                self.current_phase      = Phase.IDLE
+                self._placing_started   = False
+                self._returning_started = False
+                print(f"[PhaseDetector] Test complete at frame {frame_idx}")
 
-        self.phase_history.append(self.current_phase)
-        return self.current_phase, event
+            # ── Zazaj fill event (nov pin zapolnjen) ──────────────────────────
+            event = None
+            if (filled_count > self._last_filled
+                    and self.current_phase == Phase.PLACING):
+                event = self._on_new_fill(frame_idx, states)
 
-    # ── Rule-based classification ─────────────────────────────────────────────
+            self._last_filled = filled_count
+            self.phase_history.append(self.current_phase)
+            return self.current_phase, event
 
-    def _classify(self, velocity: float, pinch_dist: float) -> Phase:
+        except Exception as e:
+            print(f"[PhaseDetector] ERROR frame {frame_idx}: {e}")
+            return self.current_phase, None
+
+    # ── Fill event handler ────────────────────────────────────────────────────
+
+    def _on_new_fill(self, frame_idx: int, states: dict) -> PegEvent:
         """
-        Simple decision tree based on velocity + pinch distance.
-        Tune thresholds in constants above after reviewing real data.
+        Kliče se ko HoleTracker zazna novo zapolnjeno luknjico.
+        Izračuna trajanje in kinematične povzetke za ta interval.
         """
-        pinch_closed = pinch_dist < PINCH_CLOSED_MM
-        moving       = velocity   > VEL_MOVING_THRESHOLD
-        slow         = velocity   < VEL_SLOW_THRESHOLD
+        self._peg_count += 1
 
-        if self.current_phase == Phase.IDLE:
-            if moving:
-                return Phase.REACHING
-            return Phase.IDLE
+        duration = (frame_idx - self._last_fill_frame) / FPS
 
-        if self.current_phase == Phase.REACHING:
-            if slow and not pinch_closed:
-                return Phase.GRASPING
-            if slow and pinch_closed:
-                return Phase.TRANSPORTING
-            return Phase.REACHING
+        # Kinematični povzetki za interval od zadnjega fill do tega
+        mean_vel  = float(np.mean(self._interval_velocities))  \
+                    if self._interval_velocities  else None
+        max_vel   = float(np.max(self._interval_velocities))   \
+                    if self._interval_velocities  else None
+        mean_acc  = float(np.mean(self._interval_accelerations))\
+                    if self._interval_accelerations else None
 
-        if self.current_phase == Phase.GRASPING:
-            if pinch_closed and moving:
-                return Phase.TRANSPORTING
-            if not moving and not pinch_closed:
-                return Phase.IDLE
-            return Phase.GRASPING
+        # Path length — razlika od zadnjega fill
+        wrist = states.get("wrist")
+        path  = None
+        if wrist is not None and wrist.path_length is not None:
+            path = wrist.path_length - self._interval_path_start
+            self._interval_path_start = wrist.path_length
 
-        if self.current_phase == Phase.TRANSPORTING:
-            if slow and pinch_closed:
-                return Phase.PLACING
-            return Phase.TRANSPORTING
+        event = PegEvent(
+            peg_number=        self._peg_count,
+            frame_start=       self._last_fill_frame,
+            frame_end=         frame_idx,
+            duration_s=        duration,
+            mean_velocity=     mean_vel,
+            max_velocity=      max_vel,
+            mean_acceleration= mean_acc,
+            path_length=       path,
+        )
+        self.events.append(event)
 
-        if self.current_phase == Phase.PLACING:
-            if not pinch_closed and moving:
-                return Phase.RETURNING
-            if not pinch_closed and slow:
-                # Peg placed, hand releasing
-                return Phase.RETURNING
-            return Phase.PLACING
+        mean_str = f"{mean_vel:.3f}" if mean_vel is not None else "N/A"
+        print(f"[PhaseDetector] Pin {self._peg_count}/9 → {duration:.2f}s vel_mean={mean_str}m/s")
 
-        if self.current_phase == Phase.RETURNING:
-            if slow:
-                return Phase.IDLE
-            return Phase.RETURNING
-
-        return Phase.IDLE
-
-    # ── Phase transition handler ──────────────────────────────────────────────
-
-    def _on_phase_change(self, new_phase: Phase, frame_idx: int) -> Optional[PegEvent]:
-        """
-        Called when phase switches. Returns a PegEvent if a full cycle completed.
-        """
-        event = None
-
-        # A new peg cycle starts when we leave IDLE into REACHING
-        if new_phase == Phase.REACHING and self.current_phase == Phase.IDLE:
-            self._cycle_start_frame = frame_idx
-            self._reach_frames      = 0
-            self._grasp_frames      = 0
-            self._transport_frames  = 0
-            self._place_frames      = 0
-
-        # A peg cycle completes when we return to IDLE after RETURNING
-        if new_phase == Phase.IDLE and self.current_phase == Phase.RETURNING:
-            self._peg_count += 1
-            duration = (frame_idx - self._cycle_start_frame) / FPS
-            event = PegEvent(
-                peg_number=       self._peg_count,
-                frame_start=      self._cycle_start_frame,
-                frame_end=        frame_idx,
-                duration_s=       duration,
-                reach_frames=     self._reach_frames,
-                grasp_frames=     self._grasp_frames,
-                transport_frames= self._transport_frames,
-                place_frames=     self._place_frames,
-            )
-            self.events.append(event)
+        # Reset interval buffer za naslednji pin
+        self._interval_velocities    = []
+        self._interval_accelerations = []
+        self._last_fill_frame        = frame_idx
 
         return event
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _pinch_distance(thumb_mm: np.ndarray, index_mm: np.ndarray) -> float:
-        """Euclidean distance between thumb tip and index tip in mm."""
-        if thumb_mm is None or index_mm is None:
-            return float("inf")
-        return float(np.linalg.norm(thumb_mm - index_mm))
-
-    def _count_phase_frame(self, phase: Phase):
-        if phase == Phase.REACHING:
-            self._reach_frames     += 1
-        elif phase == Phase.GRASPING:
-            self._grasp_frames     += 1
-        elif phase == Phase.TRANSPORTING:
-            self._transport_frames += 1
-        elif phase == Phase.PLACING:
-            self._place_frames     += 1
-
     def reset(self):
-        """Reset all state between patients/videos."""
-        self.current_phase    = Phase.IDLE
-        self._candidate       = Phase.IDLE
-        self._candidate_count = 0
-        self._phase_start_frame = 0
-        self._peg_count       = 0
-        self._reach_frames    = 0
-        self._grasp_frames    = 0
-        self._transport_frames= 0
-        self._place_frames    = 0
-        self._cycle_start_frame = 0
-        self.phase_history    = []
-        self.events           = []
+        """Reset med videi/pacienti."""
+        self.current_phase          = Phase.IDLE
+        self._peg_count             = 0
+        self._last_fill_frame       = 0
+        self._last_filled           = 0
+        self._placing_started       = False
+        self._returning_started     = False
+        self._interval_velocities   = []
+        self._interval_accelerations= []
+        self._interval_path_start   = 0.0
+        self.phase_history          = []
+        self.events                 = []
 
     @property
     def peg_count(self) -> int:
         return self._peg_count
 
 
-# ── Phase color map for visualizer ───────────────────────────────────────────
-# BGR colors for each phase overlay in OpenCV
+# ── Phase barve za visualizer (BGR za OpenCV) ─────────────────────────────────
 
 PHASE_COLORS = {
-    Phase.IDLE:         (100, 100, 100),   # grey
-    Phase.REACHING:     (0,   200, 255),   # yellow
-    Phase.GRASPING:     (0,   140, 255),   # orange
-    Phase.TRANSPORTING: (0,   255,   0),   # green
-    Phase.PLACING:      (255, 100,   0),   # blue
-    Phase.RETURNING:    (255,   0, 150),   # purple
+    Phase.IDLE:      (100, 100, 100),   # siva
+    Phase.PLACING:   (0,   255,   0),   # zelena
+    Phase.RETURNING: (255,   0, 150),   # vijolična
 }

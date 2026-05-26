@@ -26,6 +26,7 @@ COMEBACK_WINDOW     = 50
 FILL_THRESHOLD      = 0.65
 CONFIRM_FRAMES      = 5
 MAX_SIMULTANEOUS    = 2
+PICK_CONFIRM_FRAMES = 8  # consecutive bright frames to confirm pin picked
 
 
 class HoleTracker:
@@ -43,6 +44,8 @@ class HoleTracker:
         self._min_brightness     = None
         self._prev_mean          = None
         self._stable_count       = 0
+        self.fill_order          = []   # (side, idx) tuples in fill sequence
+        self.pick_order          = []   # (side, idx) tuples in pick sequence
 
     def initialize(self, frame: np.ndarray):
         """Called once on first frame. Registers hole positions and sector bboxes."""
@@ -55,7 +58,7 @@ class HoleTracker:
             self.holes.append({
                 "x": x, "y": y, "side": side, "idx": idx,
                 "filled": False, "baseline": None,
-                "led_off": False, "dark_count": 0,
+                "led_off": False, "dark_count": 0, "bright_count": 0,
             })
 
         margin = int(HOLE_RADIUS_PX * 3)
@@ -118,14 +121,29 @@ class HoleTracker:
             self.filled_count = sum(1 for h in self.holes if h["filled"])
             return self.filled_count
 
+        placing_done = len(self.fill_order) >= 8
+
         for h, is_dark in candidates:
             if is_dark:
                 h["dark_count"] += 1
-                if h["dark_count"] >= CONFIRM_FRAMES:
-                    h["filled"] = True
+                h["bright_count"] = 0
+                key = (h["side"], h["idx"])
+                if h["dark_count"] >= CONFIRM_FRAMES and not h["filled"]:
+                    if key not in self.fill_order:
+                        h["filled"] = True
+                        self.fill_order.append(key)
             else:
                 h["dark_count"] = 0
-                h["filled"] = False
+                if h["filled"] and placing_done:
+                    h["bright_count"] += 1
+                    if h["bright_count"] >= PICK_CONFIRM_FRAMES:
+                        h["filled"] = False
+                        h["bright_count"] = 0
+                        self.pick_order.append((h["side"], h["idx"]))
+                else:
+                    h["bright_count"] = 0
+                    if not placing_done:
+                        h["filled"] = False
 
         self.filled_count = sum(1 for h in self.holes if h["filled"])
         return self.filled_count
@@ -153,19 +171,14 @@ class HoleTracker:
 
     @property
     def active_side(self):
-        """
-        Returns which sector has active LEDs.
-        'L' = left sector active  → patient uses RIGHT hand
-        'R' = right sector active → patient uses LEFT hand
-        None = not yet determined
-        """
+        """Majority vote — side with more active holes wins."""
         if not self._baseline_set:
             return None
-        left_active  = any(not h["led_off"] for h in self.holes if h["side"] == "L")
-        right_active = any(not h["led_off"] for h in self.holes if h["side"] == "R")
-        if left_active and not right_active:
+        left_count  = sum(1 for h in self.holes if h["side"] == "L" and not h["led_off"])
+        right_count = sum(1 for h in self.holes if h["side"] == "R" and not h["led_off"])
+        if left_count > right_count:
             return "L"
-        if right_active and not left_active:
+        if right_count > left_count:
             return "R"
         return None
 
@@ -211,19 +224,27 @@ class HoleTracker:
         self._prev_mean = mean_b
 
     def _set_baseline(self, gray: np.ndarray):
-        """Set baseline — dark holes = inactive, bright = active."""
+        """Set baseline — activate exactly 9 holes from the brighter sector."""
         brightnesses = [
             self._sample_brightness(gray, h["x"], h["y"])
             for h in self.holes
         ]
         for h, b in zip(self.holes, brightnesses):
             h["baseline"] = b
-            recovery = b / max(self._initial_brightness, 1)
-            if recovery > 0.5:
-                h["led_off"] = False
-            else:
-                h["led_off"] = True
-                h["filled"]  = False
+
+        left_holes  = [(h, b) for h, b in zip(self.holes, brightnesses) if h["side"] == "L"]
+        right_holes = [(h, b) for h, b in zip(self.holes, brightnesses) if h["side"] == "R"]
+        left_mean   = np.mean([b for _, b in left_holes])
+        right_mean  = np.mean([b for _, b in right_holes])
+        active_holes = left_holes if left_mean > right_mean else right_holes
+
+        for h in self.holes:
+            h["led_off"] = True
+            h["filled"]  = False
+
+        for h, b in active_holes:
+            h["led_off"]  = False
+            h["baseline"] = b
 
         self._baseline_set = True
         active = sum(1 for h in self.holes if not h["led_off"])

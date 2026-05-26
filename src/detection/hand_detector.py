@@ -5,7 +5,8 @@
 #   1. Detect up to MP_MAX_HANDS hands
 #   2. Wait for baseline_ready signal (HoleTracker must set baseline first)
 #   3. Activation: index_tip OR thumb_tip enters STORAGE_BBOX_PX
-#   4. Once activated → track that hand FOR ENTIRE VIDEO
+#   4. Once activated → lock onto that hand by HANDEDNESS LABEL (not index)
+#      This prevents losing the hand when MediaPipe swaps hand indices between frames
 
 import cv2
 import mediapipe as mp
@@ -42,7 +43,8 @@ class HandDetector:
     """
     Stateful hand detector.
     Waits for HoleTracker baseline before activating.
-    Locks onto first hand entering storage bbox — tracks for entire video.
+    Locks onto first hand entering storage bbox.
+    Tracks by handedness label (LEFT/RIGHT) — robust against MediaPipe index swaps.
     """
 
     def __init__(self):
@@ -56,8 +58,9 @@ class HandDetector:
             min_tracking_confidence=MP_TRACKING_CONFIDENCE,
         )
 
-        self._active_hand_idx = None   # index of active hand in MediaPipe results
-        self._activated       = False  # True once active hand is locked
+        self._active_hand_idx   = None   # fallback index if no handedness available
+        self._active_hand_label = None   # "Left" or "Right" — primary tracking key
+        self._activated         = False  # True once active hand is locked
 
     def process(self, frame: np.ndarray,
                 baseline_ready: bool = False) -> HandDetection:
@@ -97,6 +100,7 @@ class HandDetector:
             return x1 <= lx <= x2 and y1 <= ly <= y2
 
         def make_detection(hand_lm) -> HandDetection:
+            """Build HandDetection from MediaPipe hand landmarks object."""
             lm = hand_lm.landmark
             return HandDetection(
                 wrist=     to_px(lm, LANDMARKS_OF_INTEREST["wrist"]),
@@ -105,33 +109,48 @@ class HandDetector:
                 all_landmarks=hand_lm,
             )
 
-        # Already activated — always return same hand index
+        # ── Already activated — find same hand by label ──────────────────────
         if self._activated:
-            if self._active_hand_idx < n_hands:
+            # Primary: match by handedness label (robust against index swaps)
+            if self._active_hand_label and results.multi_handedness:
+                for i, handedness in enumerate(results.multi_handedness):
+                    if handedness.classification[0].label == self._active_hand_label:
+                        if i < n_hands:
+                            return make_detection(results.multi_hand_landmarks[i])
+
+            # Fallback: use saved index if no handedness available
+            elif self._active_hand_idx is not None and self._active_hand_idx < n_hands:
                 return make_detection(
                     results.multi_hand_landmarks[self._active_hand_idx]
                 )
-            else:
-                # Temporarily lost — Kalman will interpolate
-                return HandDetection(wrist=None, thumb_tip=None,
-                                     index_tip=None, all_landmarks=None)
 
-        # Not yet activated — wait for baseline before locking
+            # Temporarily lost — Kalman will interpolate
+            return HandDetection(wrist=None, thumb_tip=None,
+                                 index_tip=None, all_landmarks=None)
+
+        # ── Not yet activated — wait for baseline ────────────────────────────
         if not baseline_ready:
             return HandDetection(wrist=None, thumb_tip=None,
                                  index_tip=None, all_landmarks=None)
 
-        # Baseline is ready — look for hand entering storage bbox
+        # ── Baseline ready — look for hand entering storage bbox ─────────────
         for i, hand_lm in enumerate(results.multi_hand_landmarks):
             lm = hand_lm.landmark
             index_in = in_bbox(lm, LANDMARKS_OF_INTEREST["index_tip"],
                                sx1, sy1, sx2, sy2)
             thumb_in  = in_bbox(lm, LANDMARKS_OF_INTEREST["thumb_tip"],
                                 sx1, sy1, sx2, sy2)
+
             if index_in or thumb_in:
+                # Save handedness label for robust tracking across frames
+                if results.multi_handedness:
+                    self._active_hand_label = (
+                        results.multi_handedness[i].classification[0].label
+                    )
                 self._active_hand_idx = i
                 self._activated       = True
-                print(f"[HandDetector] Active hand locked: index={i}")
+                print(f"[HandDetector] Active hand locked: "
+                      f"index={i}, label={self._active_hand_label or '?'}")
                 return make_detection(hand_lm)
 
         return HandDetection(wrist=None, thumb_tip=None,

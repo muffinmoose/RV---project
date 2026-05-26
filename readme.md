@@ -1,6 +1,6 @@
 # 9HPT Kinematična Analiza
 
-Avtomatska kinematična analiza gibanja roke pri **Nine-Hole Peg Testu (9HPT)** iz video posnetkov.
+Avtomatska kinematična analiza gibanja roke pri **Nine-Hole Pin Test (9HPT)** iz video posnetkov.
 
 ---
 
@@ -8,7 +8,7 @@ Avtomatska kinematična analiza gibanja roke pri **Nine-Hole Peg Testu (9HPT)** 
 
 ### Predpogoji
 - Docker
-- SSH dostop do strežnika (port 3322, user: matejh, host: 192.168.32.141)
+- SSH dostop do strežnika
 
 ### Interaktivni način
 ```bash

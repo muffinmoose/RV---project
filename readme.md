@@ -58,10 +58,6 @@ Za vsak video → `results/<patient_id>/<video_stem>/`:
 | `*_board.png` | Board figura s trajektorijo |
 | `*_results.csv` | Per-zatič statistike |
 
-### Download rezultatov (Windows CMD)
-```cmd
-scp -P 3322 -r matejh@192.168.32.141:/media/FastDataMama/MatejH/results/patient_XXX "C:\Users\matej\...\Results_testing\"
-```
 
 ---
 

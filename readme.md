@@ -1,93 +1,101 @@
-# 9HPT Kinematična Analiza
+# 9HPT Kinematična Analiza — Navodila za zagon
 
-Avtomatska kinematična analiza gibanja roke pri **Nine-Hole Peg Test (9HPT)** iz video posnetkov brez markerjev.
+## Korak 1 — Postavi se v pravo mapo
+
+```bash
+cd /media/FastDataMama/MatejH
+```
 
 ---
 
-## Predpogoji
+## Korak 2 — Zgradi Docker image (samo prvič, traja ~5 min)
 
-- Docker
-- Video posnetki 9HPT (kamera od zgoraj, format MP4)
-- `config/calibration.json` — kalibracijski parametri kamere
+```bash
+docker build -t rv-project .
+```
 
 ---
 
-## Zagon
+## Korak 3 — Zaženi analizo
 
-### 1. En video (interaktivni način)
+### Način A: Interaktivni (najlažje)
+
 ```bash
 docker run -it \
- -v /pot/do/projekta:/workdir \
- -v /pot/do/podatkov:/pot/do/podatkov \
- rv-project \
- python3 src/main.py
+  -v /media/FastDataMama/MatejH:/workdir \
+  -v /media/FastDataMama/data_rv_26:/media/FastDataMama/data_rv_26 \
+  rv-project \
+  python3 src/main.py
 ```
 
-### 2. Batch način (več videov naenkrat)
+Program te bo sam vodil:
+1. Vpiši številko pacienta (npr. `064`)
+2. Izberi video iz ponujenega seznama
+3. Počakaj — rezultati se shranijo v `/media/FastDataMama/MatejH/testing/results/`
+
+---
+
+### Način B: Direktno poda pot
+
 ```bash
 docker run -it \
- -v /pot/do/projekta:/workdir \
- -v /pot/do/podatkov:/pot/do/podatkov \
- rv-project \
- python3 src/main.py /pot/video1.mp4 /pot/video2.mp4
+  -v /media/FastDataMama/MatejH:/workdir \
+  -v /media/FastDataMama/data_rv_26:/media/FastDataMama/data_rv_26 \
+  rv-project \
+  python3 src/main.py --input /media/FastDataMama/data_rv_26/patient_064
 ```
 
-### 3. Vsi posnetki enega pacienta
+Za en sam video:
 ```bash
 docker run -it \
- -v /pot/do/projekta:/workdir \
- -v /pot/do/podatkov:/pot/do/podatkov \
- rv-project \
- python3 src/main.py /pot/do/patient_XXX/patient_XXXcamP_1_*.mp4
+  -v /media/FastDataMama/MatejH:/workdir \
+  -v /media/FastDataMama/data_rv_26:/media/FastDataMama/data_rv_26 \
+  rv-project \
+  python3 src/main.py --input /media/FastDataMama/data_rv_26/patient_064/patient_064camP_1_20230413_13_13_07.mp4
 ```
 
-### 4. Kohortna analiza (po batch procesiranju)
+---
+
+### Način C: Analiza vseh pacientov skupaj
+
 ```bash
 docker run --rm \
- -v /pot/do/projekta:/workdir \
- rv-project \
- python3 testing/analyze.py
+  -v /media/FastDataMama/MatejH:/workdir \
+  rv-project \
+  python3 testing/analyze.py
 ```
-
-Generira grafe in `all_patients.csv` v `testing/analysis/`.
 
 ---
 
-## Izhodni podatki
+## Korak 4 — Rezultati
 
-Za vsak video → `testing/results/<patient_id>/<video_stem>/`:
-
-| Datoteka | Opis |
-|---|---|
-| `*_analyzed.mp4` | Anotiran video z landmarki in fazami |
-| `*_graphs.png` | Kinematični grafi + tabela povzetkov |
-| `*_board.png` | Board figura s trajektorijo v mm |
-| `*_results.csv` | Per-zatič statistike (čas, hitrost, pot) |
-
-Kohortna analiza → `testing/analysis/`:
+**Za vsak video** se shranijo v:
+```
+/media/FastDataMama/MatejH/testing/results/<patient_id>/<video_stem>/
+```
 
 | Datoteka | Opis |
 |---|---|
-| `all_patients.csv` | Agregiran povzetek vseh posnetkov |
-| `plot_01_pin_time.png` | Povprečen čas na zatič po pacientih |
+| `*_analyzed.mp4` | Video z označenimi landmarki in fazami |
+| `*_graphs.png` | Kinematični grafi |
+| `*_board.png` | Trajektorija v mm |
+| `*_results.csv` | Statistike po zatičih |
+
+**Po analizi vseh pacientov skupaj** se shranijo v:
+```
+/media/FastDataMama/MatejH/testing/analysis/
+```
+
+| Datoteka | Opis |
+|---|---|
+| `all_patients.csv` | Povzetek vseh posnetkov |
+| `plot_01_pin_time.png` | Povprečen čas na zatič |
 | `plot_02_distribution.png` | Porazdelitev časov |
 | `plot_03_velocity_time.png` | Hitrost vs čas |
 | `plot_04_fatigue.png` | Trend utrujenosti |
 | `plot_07_learning.png` | Krivulja učenja med sejami |
 | `plot_08_within_patient.png` | Variabilnost znotraj pacienta |
 | `plot_09_path_vs_time.png` | Korelacija pot vs čas |
-
----
-
-## Reprodukcija rezultatov
-
-Za reprodukcijo rezultatov iz poročila:
-
-1. Zagoni batch procesiranje za vse paciente (003–072, kamera camP_1)
-2. Zagoni kohortno analizo: `python3 testing/analyze.py`
-3. Grafi se shranijo v `testing/analysis/`
-
-Minimalni prag za veljavni posnetek: **6 od 9 zatičev** zaznanih.
 
 ---
 
